@@ -1,0 +1,1015 @@
+package ktntwitchgo
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type EventHandler func(data any)
+
+type Client struct {
+	clientSecret	string
+	clientID		string
+
+	user			*User
+	accessToken		*string
+	refreshToken	*string
+	scopes			[]Scope
+	redirectURI		*string
+
+	throwRateLimitErrors bool
+
+	baseURL			string
+	ingestBaseURL	string
+	httpClient		*http.Client
+	refreshAttempts	int
+	ready			bool
+
+	eventHandlers	map[string][]EventHandler
+}
+
+func CreateTwitchApi(config TwitchApiConfig) *Client {
+	client := &Client{
+		clientSecret:			config.ClientSecret,
+		clientID:				config.ClientID,
+		accessToken: 			config.AccessToken,
+		refreshToken: 			config.RefreshToken,
+		scopes:					config.Scopes,
+		redirectURI: 			config.RedirectURI,
+		throwRateLimitErrors:	config.ThrowRatelimitErrors != nil && *config.ThrowRatelimitErrors,
+		baseURL:				"https://api.twitch.tv/helix",
+		ingestBaseURL:			"https://ingest.twitch.tv",
+		refreshAttempts: 		0,
+		ready:					false,
+		eventHandlers: 			make(map[string][]EventHandler),
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+
+	client.initialize()
+	return client
+}
+
+func (c *Client) AddEventHandler(event string, handler EventHandler) {
+	c.eventHandlers[event] = append(c.eventHandlers[event], handler)
+}
+
+func (c *Client) RemoveEventHandler(event string) {
+	delete(c.eventHandlers, event)
+}
+
+func (c *Client) emit(event string, data interface{}) {
+	if handlers, exists := c.eventHandlers[event]; exists {
+		for _, handler := range handlers {
+			handler(data)
+		}
+	}
+}
+
+func (c *Client) initialize() {
+	if c.accessToken != nil {
+		go func() {
+			user, err := c.GetCurrentUser()
+			if err == nil && user != nil {
+				c.user = user
+			}
+		}()
+	}
+}
+
+func (c *Client) error(message string) error {
+	return fmt.Errorf("%s", message)
+}
+
+func (c *Client) getAppAccessToken(ctx context.Context) (*string, error) {
+	data := map[string]string{
+		"client_id":		c.clientID,
+		"client_secret":	c.clientSecret,
+		"grant_type":		"client_credentials",
+	}
+
+	if len(c.scopes) > 0 {
+		scopeStrings := ScopesToStrings(c.scopes)
+		data["scope"] = strings.Join(scopeStrings, " ")
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://id.twitch.tv/oauth2/token", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("error getting app access token. Expected JSON but got: %s", string(body))
+	}
+
+	if accessToken, ok := result["access_token"].(string); ok {
+		return &accessToken, nil
+	}
+
+	return nil, fmt.Errorf("no access_token in response")
+}
+
+func (c *Client) refresh(ctx context.Context) error {
+	valid, err := c.validate(ctx)
+	if err != nil {
+		return err
+	}
+
+	if valid {
+		return nil
+	}
+
+	if c.refreshToken == nil {
+		return c.error("refresh token is not set")
+	}
+
+	data := map[string]string{
+		"client_id":		c.clientID,
+		"client_secret":	c.clientSecret,
+		"grant_type":		"refresh_token",
+		"refresh_token":	url.QueryEscape(*c.refreshToken),
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://id.twitch.tv/oauth2/token", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var result AuthEvent
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	if result.AccessToken != "" {
+		c.accessToken = &result.AccessToken
+	}
+	if result.RefreshToken != "" {
+		c.refreshToken = &result.RefreshToken
+	}
+
+	c.emit("refresh", result)
+
+	if result.AccessToken == "" {
+		c.refreshAttempts++
+	}
+
+	return nil
+}
+
+func (c *Client) validate(ctx context.Context) (bool, error) {
+	if c.accessToken == nil {
+		return false, nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://id.twitch.tv/oauth2/validate", nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "OAuth " + *c.accessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+
+	if message, ok := result["message"].(string); ok && message == "missing authorization token" {
+		return false, c.error(message)
+	}
+
+	return resp.StatusCode == 200, nil
+}
+
+func (c *Client) get(ctx context.Context, endpoint string, apiType string) ([]byte, error) {
+	if c.accessToken == nil {
+		token, err := c.getAppAccessToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if token == nil {
+			return nil, c.error("app access token could not be fetched. Please check your client_id and client_secret")
+		}
+		c.accessToken = token
+	}
+
+	var baseURL string
+	switch apiType {
+	case "helix":
+		baseURL = c.baseURL
+	case "ingest":
+		baseURL = c.ingestBaseURL
+	default:
+		baseURL = c.baseURL
+	}
+
+	fullURL := baseURL + endpoint
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Client-ID", c.clientID)
+	req.Header.Set("Authorization", "Bearer " + *c.accessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	c.handleRateLimit(resp.Header)
+
+	if resp.StatusCode == 401 {
+		if err := c.refresh(ctx); err != nil {
+			return nil, err
+		}
+		return c.get(ctx, endpoint, apiType)
+	}
+
+	if resp.StatusCode == 429 {
+		rateLimit := c.extractRateLimit(resp.Header)
+		c.emit("ratelimit", rateLimit)
+
+		if c.throwRateLimitErrors {
+			return nil, &TwitchApiRateLimitError{RateLimit: rateLimit}
+		}
+
+		sleepTime := time.Duration(rateLimit.Reset) * time.Second - time.Duration(time.Now().Unix()) * time.Second
+		if sleepTime > 0 {
+			time.Sleep(sleepTime)
+		}
+
+		return c.get(ctx, endpoint, apiType)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+func (c *Client) update(ctx context.Context, endpoint string, data interface{}, method string) ([]byte, error) {
+	if !strings.HasPrefix(endpoint, "/") {
+		return nil, c.error("endpoint must start with a '/' (forward slash)")
+	}
+
+	var body io.Reader
+	if data != nil {
+		jsonData, err := json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewBuffer(jsonData)
+	}
+
+	fullURL := c.baseURL + endpoint
+
+	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(method), fullURL, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if data != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Authorization", "Bearer " + *c.accessToken)
+	req.Header.Set("Client-ID", c.clientID)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	c.handleRateLimit(resp.Header)
+
+	if resp.StatusCode == 401 {
+		if err := c.refresh(ctx); err != nil {
+			return nil, err
+		}
+		return c.update(ctx, endpoint, data, method)
+	}
+
+	if resp.StatusCode == 429 {
+		rateLimit := c.extractRateLimit(resp.Header)
+		c.emit("ratelimit", rateLimit)
+
+		if c.throwRateLimitErrors {
+			return nil, &TwitchApiRateLimitError{RateLimit: rateLimit}
+		}
+
+		sleepTime := time.Duration(rateLimit.Reset) * time.Second - time.Duration(time.Now().Unix()) * time.Second
+		if sleepTime > 0 {
+			time.Sleep(sleepTime)
+		}
+		return c.update(ctx, endpoint, data, method)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+func (c *Client) post(ctx context.Context, endpoint string, data interface{}) ([]byte, error) {
+	return c.update(ctx, endpoint, data, "post")
+}
+
+func (c *Client) put(ctx context.Context, endpoint string, data interface{}) ([]byte, error) {
+	return c.update(ctx, endpoint, data, "put")
+}
+
+func (c *Client) patch(ctx context.Context, endpoint string, data interface{}) ([]byte, error) {
+	return c.update(ctx, endpoint, data, "patch")
+}
+
+func (c *Client) delete(ctx context.Context, endpoint string, data interface{}) ([]byte, error) {
+	return c.update(ctx, endpoint, data, "delete")
+}
+
+func (c *Client) handleRateLimit(headers http.Header) {
+	rateLimit := c.extractRateLimit(headers)
+	c.emit("ratelimitpoll", rateLimit)
+}
+
+func (c *Client) extractRateLimit(headers http.Header) TwitchApiRateLimit {
+	limit, _ := strconv.Atoi(headers.Get("Ratelimit-Limit"))
+	remaining, _ := strconv.Atoi(headers.Get("Ratelimit-Remaining"))
+	reset, _ := strconv.Atoi(headers.Get("Ratelimit-Reset"))
+
+	return TwitchApiRateLimit{
+		Limit:		limit,
+		Remaining:	remaining,
+		Reset:		reset,
+	}
+}
+
+func (c *Client) hasScope(scope Scope) bool {
+	for _, s := range c.scopes {
+		if s == scope {
+			return true
+		}
+	}
+
+	return false
+}
+
+func parseMixedParam(values interface{}, stringKey, numericKey string) string {
+	var params []string
+
+	switch v := values.(type) {
+	case []string:
+		for _, val := range v {
+			params = append(params, fmt.Sprintf("%s=%s", stringKey, url.QueryEscape(val)))
+		}
+	case []int:
+		for _, val := range v {
+			params = append(params, fmt.Sprintf("%s=%d", numericKey, val))
+		}
+	case string:
+		params = append(params, fmt.Sprintf("%s=%s", stringKey, url.QueryEscape(v)))
+	case int:
+		params = append(params, fmt.Sprintf("%s=%d", numericKey, v))
+	}
+
+	return strings.Join(params, "&")
+}
+
+func parseOptions(options interface{}) string {
+	params := url.Values{}
+
+	data, _ := json.Marshal(options)
+	var fields map[string]interface{}
+	json.Unmarshal(data, &fields)
+
+	for key, value := range fields {
+		if value != nil {
+			switch v := value.(type) {
+			case string:
+				if v != "" {
+					params.Add(key, v)
+				}
+			case float64:
+				params.Add(key, strconv.FormatFloat(v, 'f', -1, 64))
+			case bool:
+				params.Add(key, strconv.FormatBool(v))
+			case []interface{}:
+				for _, item := range v {
+					if str, ok := item.(string); ok && str != "" {
+						params.Add(key, str)
+					}
+				}
+			}
+		}
+	}
+
+	return params.Encode()
+}
+
+func isNumber(s string) bool {
+	_, err := strconv.Atoi(s)
+	return err == nil
+}
+
+func (c *Client) GenerateAuthURL() string {
+	base := "https://id.twitch.tv/oauth2/authorize"
+	params := url.Values{}
+	params.Add("client_id", c.clientID)
+	params.Add("response_type", "code")
+
+	if c.redirectURI != nil {
+		params.Add("redirect_uri", *c.redirectURI)
+	}
+
+	if len(c.scopes) > 0 {
+		scopeStrings := ScopesToStrings(c.scopes)
+		params.Add("scope", strings.Join(scopeStrings, " "))
+	}
+
+	return base + "?" + params.Encode()
+}
+
+func (c *Client) BanUser(ctx context.Context, channel, user, reason string) (*APIBanResponse, error) {
+	if c.user == nil {
+		return &APIBanResponse{Data: []Ban{}}, c.error("local user is null")
+	}
+
+	users, err := c.GetUsers(ctx, []string{channel, c.user.Login, user})
+	if err != nil {
+		return &APIBanResponse{Data: []Ban{}}, err
+	}
+
+	var channelUser, modUser, userUser *User
+	for _, u := range users.Data {
+		switch u.Login {
+		case channel:
+			channelUser = &u
+		case c.user.Login:
+			modUser = &u
+		case user:
+			userUser = &u
+		}
+	}
+
+	if channelUser == nil || modUser == nil || userUser == nil {
+		return &APIBanResponse{Data: []Ban{}}, c.error("failed to fetch required users")
+	}
+
+	query := fmt.Sprintf("?broadcaster_id=%s&moderator_id=%s", channelUser.ID, modUser.ID)
+	endpoint := "/moderation/bans" + query
+
+	banData := map[string]interface{}{
+		"user_id": userUser.ID,
+	}
+
+	if reason != "" {
+		banData["reason"] = reason
+	}
+
+	requestData := map[string]interface{}{"data": banData}
+	data, err := c.post(ctx, endpoint, requestData)
+	if err != nil {
+		return &APIBanResponse{Data: []Ban{}}, err
+	}
+
+	var result APIBanResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return &APIBanResponse{Data: []Ban{}}, err
+	}
+
+	return &result, nil
+}
+
+func (c *Client) ShoutoutUser(ctx context.Context, channel, user string) error {
+	if c.user == nil {
+		return c.error("local user is null")
+	}
+
+	users, err := c.GetUsers(ctx, []string{channel, c.user.Login, user})
+	if err != nil {
+		return err
+	}
+
+	var channelUser, modUser, userUser *User
+	for _, u := range users.Data {
+		switch u.Login {
+		case channel:
+			channelUser = &u
+		case c.user.Login:
+			modUser = &u
+		case user:
+			userUser = &u
+		}
+	}
+
+	if channelUser == nil || modUser == nil || userUser == nil {
+		return c.error("failed to fetch required users")
+	}
+
+	endpoint := "/chat/shoutouts"
+	requestData := map[string]string{
+		"from_broadcaster_id": channelUser.ID,
+		"to_broadcaster_id": userUser.ID,
+		"moderator_id": modUser.ID,
+	}
+
+	_, err = c.post(ctx, endpoint, requestData)
+	return err
+}
+
+func (c *Client) GetUserAccess(ctx context.Context, code string) error {
+	endpoint := "https://id.twitch.tv/oauth2/token"
+	params := url.Values{}
+	params.Add("client_id", c.clientID)
+	params.Add("client_secret", c.clientSecret)
+	params.Add("code", code)
+	params.Add("grant_type", "authorization_code")
+
+	if c.redirectURI != nil {
+		params.Add("redirect_uri", *c.redirectURI)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint + "?" + params.Encode(), nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	var result AuthEvent
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	if result.AccessToken != "" {
+		c.accessToken = &result.AccessToken
+	}
+
+	if result.RefreshToken != "" {
+		c.refreshToken = &result.RefreshToken
+	}
+
+	c.emit("user_auth", result)
+	return nil
+}
+
+func simpleGetDecode[T any](c *Client, ctx context.Context, endpoint string, version string) (*T, error) {
+	data, err := c.get(ctx, endpoint, version)
+	if err != nil {
+		return nil, err
+	}
+
+	var result T
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func simplePutDecode[T any](c *Client, ctx context.Context, endpoint string) (*T, error) {
+	data, err := c.put(ctx, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result T
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func simplePostDecode[T any](c *Client, ctx context.Context, endpoint string) (*T, error) {
+	data, err := c.post(ctx, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result T
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func (c *Client) GetGames(ctx context.Context, games any) (*APIGameResponse, error) {
+	query := "?" + parseMixedParam(games, "name", "id")
+	endpoint := "/games" + query
+
+	return simpleGetDecode[APIGameResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetTopGames(ctx context.Context, options *BaseOptions) (*APIGameResponse, error) {
+	query := ""
+	if options != nil {
+		query = "?" + parseOptions(options)
+	}
+	endpoint := "/games/top" + query
+
+	return simpleGetDecode[APIGameResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetUsers(ctx context.Context, ids any) (*APIUserResponse, error) {
+	var query string
+
+	switch v := ids.(type) {
+	case []string:
+		query = "?" + parseMixedParam(v, "login", "id")
+	case []int:
+		query = "?" + parseMixedParam(v, "login", "id")
+	case string:
+		key := "login"
+		if isNumber(v) {
+			key = "id"
+		}
+		query = fmt.Sprintf("?%s=%s", key, url.QueryEscape(v))
+	case int:
+		query = fmt.Sprintf("?id=%d", v)
+	default:
+		return nil, c.error("ids must be a string, int, or slice of strings/ints")
+	}
+
+	endpoint := "/users" + query
+
+	return simpleGetDecode[APIUserResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetStreams(ctx context.Context, options *GetStreamsOptions) (*APIStreamResponse, error) {
+query := ""
+	endpoint := "/streams"
+
+	if options != nil {
+		params := url.Values{}
+
+		if options.Channel != nil {
+			key := "user_login"
+			if isNumber(*options.Channel) {
+				key = "user_id"
+			}
+			params.Add(key, *options.Channel)
+		}
+
+		for _, channel := range options.Channels {
+			key := "user_login"
+			if isNumber(channel) {
+				key = "user_id"
+			}
+			params.Add(key, channel)
+		}
+
+		if len(options.GameID) > 0 {
+			for _, gameID := range options.GameID {
+				params.Add("game_id", gameID)
+			}
+		}
+
+		if len(options.Language) > 0 {
+			for _, lang := range options.Language {
+				params.Add("language", lang)
+			}
+		}
+
+		if options.First != nil {
+			params.Add("first", strconv.Itoa(*options.First))
+		}
+		if options.After != nil {
+			params.Add("after", *options.After)
+		}
+		if options.Before != nil {
+			params.Add("before", *options.Before)
+		}
+
+		if len(params) > 0 {
+			query = "?" + params.Encode()
+		}
+	}
+
+	return simpleGetDecode[APIStreamResponse](c, ctx, endpoint + query, "helix")
+}
+
+func (c *Client) GetGlobalBadges(ctx context.Context) (*APIBadgesResponse, error) {
+	endpoint := "/chat/badges/global"
+	return simpleGetDecode[APIBadgesResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetGlobalEmotes(ctx context.Context) (*APIEmotesResponse, error) {
+	endpoint := "/chat/emotes/global"
+	return simpleGetDecode[APIEmotesResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetVideos(ctx context.Context, options GetVideosOptions) (*APIVideoResponse, error) {
+	query := "?" + parseOptions(options)
+	endpoint := "/videos" + query
+	return simpleGetDecode[APIVideoResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetClips(ctx context.Context, options interface{}) (*APIClipsResponse, error) {
+	query := "?" + parseOptions(options)
+	endpoint := "/clips" + query
+	return simpleGetDecode[APIClipsResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetChannelInformation(ctx context.Context, options GetChannelInfoOptions) (*APIChannelInfoResponse, error) {
+	query := "?" + parseOptions(options)
+	endpoint := "/channels" + query
+	return simpleGetDecode[APIChannelInfoResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) SearchChannels(ctx context.Context, options SearchChannelsOptions) (*APIChannelResponse, error) {
+	options.Query = url.QueryEscape(options.Query)
+	query := "?" + parseOptions(options)
+	endpoint := "/search/channels" + query
+	return simpleGetDecode[APIChannelResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) SearchCategories(ctx context.Context, options SearchCategoriesOptions) (*APIGameResponse, error) {
+	options.Query = url.QueryEscape(options.Query)
+	query := "?" + parseOptions(options)
+	endpoint := "/search/categories" + query
+	return simpleGetDecode[APIGameResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetExtensionTransactions(ctx context.Context, options GetExtensionTransactionsOptions) (*APIExtensionTransactionResponse, error) {
+	query := "?" + parseOptions(options)
+	endpoint := "/extensions/transactions" + query
+	return simpleGetDecode[APIExtensionTransactionResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetCheermotes(ctx context.Context, options *GetCheermotesOptions) (*APICheermoteResponse, error) {
+	query := ""
+	if options != nil {
+		query = "?" + parseOptions(options)
+	}
+
+	endpoint := "/bits/cheermotes" + query
+	return simpleGetDecode[APICheermoteResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetChannelEmotes(ctx context.Context, broadcasterID string) (*APIEmotesResponse, error) {
+	query := "?broadcaster_id=" + broadcasterID
+	endpoint := "/chat/emotes" + query
+	return simpleGetDecode[APIEmotesResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetChannelBadges(ctx context.Context, broadcasterID string) (*APIBadgesResponse, error) {
+	query := "?broadcaster_id=" + broadcasterID
+	endpoint := "/chat/badges" + query
+	return simpleGetDecode[APIBadgesResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetBitsLeaderboard(ctx context.Context, options *GetBitsLeaderboardOptions) (*APIBitsLeaderboardResponse, error) {
+	if !c.hasScope(ScopeBitsRead) {
+		return nil, c.error("missing scope: bits:read")
+	}
+
+	query := ""
+	if options != nil {
+		query = "?" + parseOptions(options)
+	}
+	endpoint := "/bits/leaderboard" + query
+	return simpleGetDecode[APIBitsLeaderboardResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetSubs(ctx context.Context, options GetSubsOptions) (*APISubResponse, error) {
+	if !c.hasScope(ScopeChannelReadSubscriptions) {
+		return nil, c.error("missing scope: channel:read:subscriptions")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/subscriptions" + query
+	return simpleGetDecode[APISubResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetBannedUsers(ctx context.Context, options GetBannedUsersOptions) (*APIBanResponse, error) {
+	if !c.hasScope(ScopeModerationRead) {
+		return nil, c.error("missing scope: moderation:read")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/moderation/banned" + query
+	return simpleGetDecode[APIBanResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetStreamMarkers(ctx context.Context, options interface{}) (*APIStreamMarkerResponse, error) {
+	if !c.hasScope(ScopeUserReadBroadcast) {
+		return nil, c.error("missing scope: user:read:broadcast")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/streams/markers" + query
+	return simpleGetDecode[APIStreamMarkerResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetUserExtensions(ctx context.Context) (*APIExtensionResponse, error) {
+	if !c.hasScope(ScopeUserReadBroadcast) {
+		return nil, c.error("missing scope: user:read:broadcast")
+	}
+
+	endpoint := "/users/extensions/list"
+	return simpleGetDecode[APIExtensionResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetUserActiveExtensions(ctx context.Context, options *GetUserActiveExtensionsOptions) (*APIActiveUserExtensionResponse, error) {
+	if !c.hasScope(ScopeUserReadBroadcast) && !c.hasScope(ScopeUserEditBroadcast) {
+		return nil, c.error("missing scope: user:read:broadcast or user:edit:broadcast")
+	}
+
+	query := ""
+	if options != nil {
+		query = "?" + parseOptions(options)
+	}
+	endpoint := "/users/extensions" + query
+	return simpleGetDecode[APIActiveUserExtensionResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) ModifyChannelInformation(ctx context.Context, options ModifyChannelInformationOptions) error {
+	if !c.hasScope(ScopeUserEditBroadcast) {
+		return c.error("missing scope: user:edit:broadcast")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/channels" + query
+
+	_, err := c.patch(ctx, endpoint, nil)
+	return err
+}
+
+func (c *Client) UpdateUser(ctx context.Context, options *UpdateUserOptions) (*APIUserResponse, error) {
+	if !c.hasScope(ScopeUserEdit) {
+		return nil, c.error("missing scope: user:edit")
+	}
+
+	query := ""
+	if options != nil && options.Description != nil {
+		query = "?" + parseOptions(options)
+	}
+	endpoint := "/users" + query
+	return simplePutDecode[APIUserResponse](c, ctx, endpoint)
+}
+
+func (c *Client) CreateClip(ctx context.Context, options CreateClipOptions) (*APICreateClipResponse, error) {
+	if !c.hasScope(ScopeClipsEdit) {
+		return nil, c.error("missing scope: clips:edit")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/clips" + query
+	return simplePostDecode[APICreateClipResponse](c, ctx, endpoint)
+}
+
+func (c *Client) GetModerators(ctx context.Context, options GetModeratorsOptions) (*APIModeratorResponse, error) {
+	if !c.hasScope(ScopeModerationRead) {
+		return nil, c.error("missing scope: moderation:read")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/moderation/moderators" + query
+	return simpleGetDecode[APIModeratorResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) GetCodeStatus(ctx context.Context, options GetCodeStatusOptions) (*APICodeStatusResponse, error) {
+	query := "?" + parseOptions(options)
+	endpoint := "/entitlements/codes" + query
+	return simpleGetDecode[APICodeStatusResponse](c, ctx, endpoint, "helix")
+}
+
+func (c *Client) StartCommercial(ctx context.Context, options StartCommercialOptions) (*APICommercialResponse, error) {
+	if !c.hasScope(ScopeChannelEditCommercial) {
+		return nil, c.error("missing scope: channel:edit:commercial")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/channels/commercial" + query
+	return simplePostDecode[APICommercialResponse](c, ctx, endpoint)
+}
+
+func (c *Client) GetCurrentUser() (*User, error) {
+	ctx := context.Background()
+	endpoint := "/users"
+
+	data, err := c.get(ctx, endpoint, "helix")
+	if err != nil {
+		return nil, err
+	}
+
+	var result APIUserResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	if len(result.Data) == 0 {
+		return nil, c.error("failed to get current user")
+	}
+
+	return &result.Data[0], nil
+}
+
+func (c *Client) GetStreamKey(ctx context.Context, options GetStreamKeyOptions) (*string, error) {
+	if !c.hasScope(ScopeChannelReadStreamKey) {
+		return nil, c.error("missing scope: channel:read:stream_key")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/streams/key" + query
+
+	data, err := c.get(ctx, endpoint, "helix")
+	if err != nil {
+		return nil, err
+	}
+
+	var result APIStreamKeyResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	if len(result.Data) == 0 {
+		return nil, c.error("no stream key found")
+	}
+
+	return &result.Data[0].Key, nil
+}
+
+func (c *Client) SendChatMessage(ctx context.Context, options SendChatMessageOptions) (*APIMessageResponse, error) {
+	if !c.hasScope(ScopeUserBot) {
+		return nil, c.error("missing scope: user:bot")
+	}
+
+	query := "?" + parseOptions(options)
+	endpoint := "/chat/messages" + query
+
+	data, err := c.post(ctx, endpoint, options)
+	if err != nil {
+		return nil, err
+	}
+
+	var result APIMessageResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func (c *Client) GetIngestServers(ctx context.Context) (*APIIngestsResponse, error) {
+	endpoint := "/ingests"
+
+	data, err := c.get(ctx, endpoint, "ingest")
+	if err != nil {
+		return nil, err
+	}
+
+	var result APIIngestsResponse
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
