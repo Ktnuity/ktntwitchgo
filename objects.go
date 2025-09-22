@@ -15,7 +15,7 @@ type User struct {
 	OfflineImageURL		string		`json:"offline_image_url"`
 	ProfileImageURL		string		`json:"profile_image_url"`
 	Type				string		`json:"type"`
-	ViewCount			string		`json:"view_count"`
+	ViewCount			int			`json:"view_count"`
 }
 
 type Channel struct {
@@ -27,7 +27,7 @@ type Channel struct {
 	ThumbnailURL		string		`json:"thumbnail_url"`
 	IsLive				bool		`json:"is_live"`
 	StartedAt			string		`json:"string"`
-	TagIDs				string		`json:"tag_ids"`
+	TagIDs				[]string	`json:"tag_ids"`
 }
 
 type ChannelInfo struct {
@@ -65,7 +65,7 @@ type Stream struct {
 	IsMature			bool		`json:"is_mature"`
 	Language			string		`json:"language"`
 	StartedAt			string		`json:"started_at"`
-	TagIDs				string		`json:"tag_ids"`
+	TagIDs				[]string	`json:"tag_ids"`
 	ThumbnailURL		string		`json:"thumbnail_url"`
 	Title				string		`json:"title"`
 	Type				string		`json:"type"`
