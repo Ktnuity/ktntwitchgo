@@ -118,7 +118,7 @@ type GetSubsOptions struct {
 }
 
 type GetChannelInfoOptions struct {
-	BroadcasterID		string			`json:"broadcaster_id"`
+	BroadcasterID		[]string		`json:"broadcaster_id"`
 }
 
 type SearchOptions struct {
