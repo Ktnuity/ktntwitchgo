@@ -72,7 +72,7 @@ type Stream struct {
 	UserID				string		`json:"user_id"`
 	UserLogin			string		`json:"user_login"`
 	UserName			string		`json:"user_name"`
-	ViewerCount			string		`json:"viewer_count"`
+	ViewerCount			int			`json:"viewer_count"`
 }
 func (s *Stream) GetThumbnailUrl(options *ThumbnailUrlOptions) string {
 	width := 1920
