@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,7 +37,7 @@ type Client struct {
 	eventHandlers	map[string][]EventHandler
 }
 
-func CreateTwitchApi(config TwitchApiConfig) *Client {
+func CreateTwitchApi(config TwitchApiConfig) (*Client, *sync.WaitGroup) {
 	client := &Client{
 		clientSecret:			config.ClientSecret,
 		clientID:				config.ClientID,
@@ -55,8 +56,8 @@ func CreateTwitchApi(config TwitchApiConfig) *Client {
 		},
 	}
 
-	client.initialize()
-	return client
+	wg := client.initialize()
+	return client, wg
 }
 
 func (c *Client) AddEventHandler(event string, handler EventHandler) {
@@ -75,15 +76,19 @@ func (c *Client) emit(event string, data interface{}) {
 	}
 }
 
-func (c *Client) initialize() {
+func (c *Client) initialize() *sync.WaitGroup {
 	if c.accessToken != nil {
-		go func() {
+		var wg sync.WaitGroup
+		wg.Go(func() {
 			user, err := c.GetCurrentUser()
 			if err == nil && user != nil {
 				c.user = user
 			}
-		}()
+		})
+		return &wg
 	}
+
+	return nil
 }
 
 func (c *Client) error(message string) error {
