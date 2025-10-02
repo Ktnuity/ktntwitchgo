@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,7 +70,7 @@ func (c *Client) RemoveEventHandler(event string) {
 	delete(c.eventHandlers, event)
 }
 
-func (c *Client) emit(event string, data interface{}) {
+func (c *Client) emit(event string, data any) {
 	if handlers, exists := c.eventHandlers[event]; exists {
 		for _, handler := range handlers {
 			handler(data)
@@ -131,7 +133,7 @@ func (c *Client) getAppAccessToken(ctx context.Context) (*string, error) {
 		return nil, err
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("error getting app access token. Expected JSON but got: %s", string(body))
 	}
@@ -219,7 +221,7 @@ func (c *Client) validate(ctx context.Context) (bool, error) {
 	}
 	defer resp.Body.Close()
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return false, err
 	}
@@ -297,7 +299,7 @@ func (c *Client) get(ctx context.Context, endpoint string, apiType string) ([]by
 	return io.ReadAll(resp.Body)
 }
 
-func (c *Client) update(ctx context.Context, endpoint string, data interface{}, method string) ([]byte, error) {
+func (c *Client) update(ctx context.Context, endpoint string, data any, method string) ([]byte, error) {
 	if !strings.HasPrefix(endpoint, "/") {
 		return nil, c.error("endpoint must start with a '/' (forward slash)")
 	}
@@ -357,19 +359,19 @@ func (c *Client) update(ctx context.Context, endpoint string, data interface{}, 
 	return io.ReadAll(resp.Body)
 }
 
-func (c *Client) post(ctx context.Context, endpoint string, data interface{}) ([]byte, error) {
+func (c *Client) post(ctx context.Context, endpoint string, data any) ([]byte, error) {
 	return c.update(ctx, endpoint, data, "post")
 }
 
-func (c *Client) put(ctx context.Context, endpoint string, data interface{}) ([]byte, error) {
+func (c *Client) put(ctx context.Context, endpoint string, data any) ([]byte, error) {
 	return c.update(ctx, endpoint, data, "put")
 }
 
-func (c *Client) patch(ctx context.Context, endpoint string, data interface{}) ([]byte, error) {
+func (c *Client) patch(ctx context.Context, endpoint string, data any) ([]byte, error) {
 	return c.update(ctx, endpoint, data, "patch")
 }
 
-func (c *Client) delete(ctx context.Context, endpoint string, data interface{}) ([]byte, error) {
+func (c *Client) delete(ctx context.Context, endpoint string, data any) ([]byte, error) {
 	return c.update(ctx, endpoint, data, "delete")
 }
 
@@ -391,65 +393,103 @@ func (c *Client) extractRateLimit(headers http.Header) TwitchApiRateLimit {
 }
 
 func (c *Client) hasScope(scope Scope) bool {
-	for _, s := range c.scopes {
-		if s == scope {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(c.scopes, scope)
 }
 
-func parseMixedParam(values interface{}, stringKey, numericKey string) string {
-	var params []string
+func parseMixedParam(values any, stringKey, numericKey string) string {
+	var query []string
 
-	switch v := values.(type) {
-	case []string:
-		for _, val := range v {
-			params = append(params, fmt.Sprintf("%s=%s", stringKey, url.QueryEscape(val)))
-		}
-	case []int:
-		for _, val := range v {
-			params = append(params, fmt.Sprintf("%s=%d", numericKey, val))
-		}
-	case string:
-		params = append(params, fmt.Sprintf("%s=%s", stringKey, url.QueryEscape(v)))
-	case int:
-		params = append(params, fmt.Sprintf("%s=%d", numericKey, v))
-	}
-
-	return strings.Join(params, "&")
-}
-
-func parseOptions(options interface{}) string {
-	params := url.Values{}
-
-	data, _ := json.Marshal(options)
-	var fields map[string]interface{}
-	json.Unmarshal(data, &fields)
-
-	for key, value := range fields {
-		if value != nil {
-			switch v := value.(type) {
-			case string:
-				if v != "" {
-					params.Add(key, v)
-				}
-			case float64:
-				params.Add(key, strconv.FormatFloat(v, 'f', -1, 64))
-			case bool:
-				params.Add(key, strconv.FormatBool(v))
-			case []interface{}:
-				for _, item := range v {
-					if str, ok := item.(string); ok && str != "" {
-						params.Add(key, str)
-					}
-				}
+	addToQuery := func (value any) {
+		switch v := value.(type) {
+		case int:
+			query = append(query, fmt.Sprintf("%s=%d", numericKey, v))
+		case string:
+			if !isNumber(v) {
+				query = append(query, fmt.Sprintf("%s=%s", stringKey, v))
+			} else {
+				query = append(query, fmt.Sprintf("%s=%s", numericKey, v))
 			}
 		}
 	}
 
-	return params.Encode()
+	switch v := values.(type) {
+	case []string:
+		for _, val := range v {
+			addToQuery(val)
+		}
+	case []int:
+		for _, val := range v {
+			addToQuery(val)
+		}
+	case int, string:
+		addToQuery(v)
+	}
+
+	return strings.Join(query, "&")
+}
+
+func chooseKey(when bool, ifTrue, ifFalse string) string {
+	if when {
+		return ifTrue
+	}
+
+	return ifFalse
+}
+
+func getJSONFieldName(field reflect.StructField) string {
+	tag := field.Tag.Get("json")
+	if tag == "" {
+		return ""
+	}
+
+	name := strings.Split(tag, ",")[0]
+	return name
+}
+
+func isZeroValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Slice, reflect.Map:
+		return v.IsNil() || v.Len() == 0
+	case reflect.Ptr, reflect.Interface:
+		return v.IsNil()
+	default:
+		return v.IsZero()
+	}
+}
+
+func parseOptions[T any](options *T) string {
+	if options == nil {
+		return ""
+	}
+
+	v := reflect.ValueOf(options).Elem()
+	t := v.Type()
+
+	var parts []string
+
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		fieldType := t.Field(i)
+
+		if !field.IsValid() || isZeroValue(field) {
+			continue
+		}
+
+		key := getJSONFieldName(fieldType)
+		if key == "" || key == "-" {
+			continue
+		}
+
+		if field.Kind() == reflect.Slice {
+			for j := 0; j < field.Len(); j++ {
+				parts = append(parts, fmt.Sprintf("%s=%v", key, field.Index(j)))
+			}
+		} else {
+			parts = append(parts, fmt.Sprintf("%s=%v", key, field))
+		}
+	}
+
+	return strings.Join(parts, "&")
 }
 
 func isNumber(s string) bool {
@@ -504,7 +544,7 @@ func (c *Client) BanUser(ctx context.Context, channel, user, reason string) (*AP
 	query := fmt.Sprintf("?broadcaster_id=%s&moderator_id=%s", channelUser.ID, modUser.ID)
 	endpoint := "/moderation/bans" + query
 
-	banData := map[string]interface{}{
+	banData := map[string]any{
 		"user_id": userUser.ID,
 	}
 
@@ -512,7 +552,7 @@ func (c *Client) BanUser(ctx context.Context, channel, user, reason string) (*AP
 		banData["reason"] = reason
 	}
 
-	requestData := map[string]interface{}{"data": banData}
+	requestData := map[string]any{"data": banData}
 	data, err := c.post(ctx, endpoint, requestData)
 	if err != nil {
 		return &APIBanResponse{Data: []Ban{}}, err
@@ -666,16 +706,11 @@ func (c *Client) GetUsers(ctx context.Context, ids any) (*APIUserResponse, error
 	var query string
 
 	switch v := ids.(type) {
-	case []string:
-		query = "?" + parseMixedParam(v, "login", "id")
-	case []int:
+	case []string, []int:
 		query = "?" + parseMixedParam(v, "login", "id")
 	case string:
-		key := "login"
-		if isNumber(v) {
-			key = "id"
-		}
-		query = fmt.Sprintf("?%s=%s", key, url.QueryEscape(v))
+		key := chooseKey(!isNumber(v), "login", "id")
+		query = fmt.Sprintf("?%s=%s", key, v)
 	case int:
 		query = fmt.Sprintf("?id=%d", v)
 	default:
@@ -688,54 +723,26 @@ func (c *Client) GetUsers(ctx context.Context, ids any) (*APIUserResponse, error
 }
 
 func (c *Client) GetStreams(ctx context.Context, options *GetStreamsOptions) (*APIStreamResponse, error) {
-query := ""
+	query := "?"
 	endpoint := "/streams"
 
-	if options != nil {
-		params := url.Values{}
-
-		if options.Channel != nil {
-			key := "user_login"
-			if isNumber(*options.Channel) {
-				key = "user_id"
-			}
-			params.Add(key, *options.Channel)
-		}
-
-		for _, channel := range options.Channels {
-			key := "user_login"
-			if isNumber(channel) {
-				key = "user_id"
-			}
-			params.Add(key, channel)
-		}
-
-		if len(options.GameID) > 0 {
-			for _, gameID := range options.GameID {
-				params.Add("game_id", gameID)
-			}
-		}
-
-		if len(options.Language) > 0 {
-			for _, lang := range options.Language {
-				params.Add("language", lang)
-			}
-		}
-
-		if options.First != nil {
-			params.Add("first", strconv.Itoa(*options.First))
-		}
-		if options.After != nil {
-			params.Add("after", *options.After)
-		}
-		if options.Before != nil {
-			params.Add("before", *options.Before)
-		}
-
-		if len(params) > 0 {
-			query = "?" + params.Encode()
-		}
+	if options == nil {
+		return simpleGetDecode[APIStreamResponse](c, ctx, endpoint, "helix")
 	}
+
+	channel, channels := options.Channel, options.Channels
+
+	if channel != nil {
+		key := chooseKey(isNumber(*channel), "user_id", "user_login")
+		query += fmt.Sprintf("%s=%s&", key, *channel)
+	}
+
+	if channels != nil {
+		query += parseMixedParam(channels, "user_login", "user_id")
+	}
+
+	query += "&"
+	query += parseOptions(options)
 
 	return simpleGetDecode[APIStreamResponse](c, ctx, endpoint + query, "helix")
 }
@@ -751,39 +758,39 @@ func (c *Client) GetGlobalEmotes(ctx context.Context) (*APIEmotesResponse, error
 }
 
 func (c *Client) GetVideos(ctx context.Context, options GetVideosOptions) (*APIVideoResponse, error) {
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/videos" + query
 	return simpleGetDecode[APIVideoResponse](c, ctx, endpoint, "helix")
 }
 
-func (c *Client) GetClips(ctx context.Context, options interface{}) (*APIClipsResponse, error) {
-	query := "?" + parseOptions(options)
+func (c *Client) GetClips(ctx context.Context, options any) (*APIClipsResponse, error) {
+	query := "?" + parseOptions(&options)
 	endpoint := "/clips" + query
 	return simpleGetDecode[APIClipsResponse](c, ctx, endpoint, "helix")
 }
 
 func (c *Client) GetChannelInformation(ctx context.Context, options GetChannelInfoOptions) (*APIChannelInfoResponse, error) {
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/channels" + query
 	return simpleGetDecode[APIChannelInfoResponse](c, ctx, endpoint, "helix")
 }
 
 func (c *Client) SearchChannels(ctx context.Context, options SearchChannelsOptions) (*APIChannelResponse, error) {
 	options.Query = url.QueryEscape(options.Query)
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/search/channels" + query
 	return simpleGetDecode[APIChannelResponse](c, ctx, endpoint, "helix")
 }
 
 func (c *Client) SearchCategories(ctx context.Context, options SearchCategoriesOptions) (*APIGameResponse, error) {
 	options.Query = url.QueryEscape(options.Query)
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/search/categories" + query
 	return simpleGetDecode[APIGameResponse](c, ctx, endpoint, "helix")
 }
 
 func (c *Client) GetExtensionTransactions(ctx context.Context, options GetExtensionTransactionsOptions) (*APIExtensionTransactionResponse, error) {
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/extensions/transactions" + query
 	return simpleGetDecode[APIExtensionTransactionResponse](c, ctx, endpoint, "helix")
 }
@@ -828,7 +835,7 @@ func (c *Client) GetSubs(ctx context.Context, options GetSubsOptions) (*APISubRe
 		return nil, c.error("missing scope: channel:read:subscriptions")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/subscriptions" + query
 	return simpleGetDecode[APISubResponse](c, ctx, endpoint, "helix")
 }
@@ -838,17 +845,17 @@ func (c *Client) GetBannedUsers(ctx context.Context, options GetBannedUsersOptio
 		return nil, c.error("missing scope: moderation:read")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/moderation/banned" + query
 	return simpleGetDecode[APIBanResponse](c, ctx, endpoint, "helix")
 }
 
-func (c *Client) GetStreamMarkers(ctx context.Context, options interface{}) (*APIStreamMarkerResponse, error) {
+func (c *Client) GetStreamMarkers(ctx context.Context, options any) (*APIStreamMarkerResponse, error) {
 	if !c.hasScope(ScopeUserReadBroadcast) {
 		return nil, c.error("missing scope: user:read:broadcast")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/streams/markers" + query
 	return simpleGetDecode[APIStreamMarkerResponse](c, ctx, endpoint, "helix")
 }
@@ -880,7 +887,7 @@ func (c *Client) ModifyChannelInformation(ctx context.Context, options ModifyCha
 		return c.error("missing scope: user:edit:broadcast")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/channels" + query
 
 	_, err := c.patch(ctx, endpoint, nil)
@@ -905,7 +912,7 @@ func (c *Client) CreateClip(ctx context.Context, options CreateClipOptions) (*AP
 		return nil, c.error("missing scope: clips:edit")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/clips" + query
 	return simplePostDecode[APICreateClipResponse](c, ctx, endpoint)
 }
@@ -915,13 +922,13 @@ func (c *Client) GetModerators(ctx context.Context, options GetModeratorsOptions
 		return nil, c.error("missing scope: moderation:read")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/moderation/moderators" + query
 	return simpleGetDecode[APIModeratorResponse](c, ctx, endpoint, "helix")
 }
 
 func (c *Client) GetCodeStatus(ctx context.Context, options GetCodeStatusOptions) (*APICodeStatusResponse, error) {
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/entitlements/codes" + query
 	return simpleGetDecode[APICodeStatusResponse](c, ctx, endpoint, "helix")
 }
@@ -931,7 +938,7 @@ func (c *Client) StartCommercial(ctx context.Context, options StartCommercialOpt
 		return nil, c.error("missing scope: channel:edit:commercial")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/channels/commercial" + query
 	return simplePostDecode[APICommercialResponse](c, ctx, endpoint)
 }
@@ -962,7 +969,7 @@ func (c *Client) GetStreamKey(ctx context.Context, options GetStreamKeyOptions) 
 		return nil, c.error("missing scope: channel:read:stream_key")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/streams/key" + query
 
 	data, err := c.get(ctx, endpoint, "helix")
@@ -987,7 +994,7 @@ func (c *Client) SendChatMessage(ctx context.Context, options SendChatMessageOpt
 		return nil, c.error("missing scope: user:bot")
 	}
 
-	query := "?" + parseOptions(options)
+	query := "?" + parseOptions(&options)
 	endpoint := "/chat/messages" + query
 
 	data, err := c.post(ctx, endpoint, options)
