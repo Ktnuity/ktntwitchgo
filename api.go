@@ -470,7 +470,7 @@ func isZeroValue(v reflect.Value) bool {
 	switch v.Kind() {
 	case reflect.Slice, reflect.Map:
 		return v.IsNil() || v.Len() == 0
-	case reflect.Ptr, reflect.Interface:
+	case reflect.Pointer, reflect.Interface:
 		return v.IsNil()
 	default:
 		return v.IsZero()
@@ -490,6 +490,10 @@ func parseOptions[T any](options *T) string {
 	for i := 0; i < v.NumField(); i++ {
 		field := v.Field(i)
 		fieldType := t.Field(i)
+
+		if field.Kind() == reflect.Pointer {
+			field = field.Elem()
+		}
 
 		if !field.IsValid() || isZeroValue(field) {
 			continue
