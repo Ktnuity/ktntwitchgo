@@ -820,6 +820,11 @@ func (c *Client) GetGlobalEmotes(ctx context.Context) (*APIEmotesResponse, error
 
 func (c *Client) GetVideos(ctx context.Context, options GetVideosOptions) (*APIVideoResponse, error) {
 	query := "?" + parseOptions(&options)
+	if strings.Contains(query, "/videos?user_id=0x") {
+		c.log("FAIL")
+	} else {
+		c.log("SUCCESS")
+	}
 	endpoint := "/videos" + query
 	return simpleGetDecode[APIVideoResponse](c, ctx, endpoint, "helix")
 }
