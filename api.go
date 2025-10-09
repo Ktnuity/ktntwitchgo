@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -38,8 +37,6 @@ type Client struct {
 	ready			bool
 
 	eventHandlers	map[string][]EventHandler
-
-	Verbose			bool
 }
 
 func CreateTwitchApi(config TwitchApiConfig) (*Client, *sync.WaitGroup) {
@@ -59,20 +56,10 @@ func CreateTwitchApi(config TwitchApiConfig) (*Client, *sync.WaitGroup) {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		Verbose: false,
 	}
 
 	wg := client.initialize()
 	return client, wg
-}
-
-func (c *Client) log(fmt string, data...any) {
-	if !c.Verbose { return }
-
-	if !strings.HasSuffix(fmt, "\n") {
-		fmt += "\n"
-	}
-	log.Printf(fmt, data...)
 }
 
 func (c *Client) AddEventHandler(event string, handler EventHandler) {
@@ -247,7 +234,6 @@ func (c *Client) validate(ctx context.Context) (bool, error) {
 }
 
 func (c *Client) get(ctx context.Context, endpoint string, apiType string) ([]byte, error) {
-	c.log("GET: Endpoint(%s)", endpoint)
 	if c.accessToken == nil {
 		token, err := c.getAppAccessToken(ctx)
 		if err != nil {
@@ -318,8 +304,6 @@ func (c *Client) update(ctx context.Context, endpoint string, data any, method s
 		return nil, c.error("endpoint must start with a '/' (forward slash)")
 	}
 
-	c.log("UPDATE: Endpoint(%s)", endpoint)
-
 	var body io.Reader
 	if data != nil {
 		jsonData, err := json.Marshal(data)
@@ -376,22 +360,18 @@ func (c *Client) update(ctx context.Context, endpoint string, data any, method s
 }
 
 func (c *Client) post(ctx context.Context, endpoint string, data any) ([]byte, error) {
-	c.log("POST: Endpoint(%s)", endpoint)
 	return c.update(ctx, endpoint, data, "post")
 }
 
 func (c *Client) put(ctx context.Context, endpoint string, data any) ([]byte, error) {
-	c.log("PUT: Endpoint(%s)", endpoint)
 	return c.update(ctx, endpoint, data, "put")
 }
 
 func (c *Client) patch(ctx context.Context, endpoint string, data any) ([]byte, error) {
-	c.log("PATCH: Endpoint(%s)", endpoint)
 	return c.update(ctx, endpoint, data, "patch")
 }
 
 func (c *Client) delete(ctx context.Context, endpoint string, data any) ([]byte, error) {
-	c.log("DELETE: Endpoint(%s)", endpoint)
 	return c.update(ctx, endpoint, data, "delete")
 }
 
@@ -704,8 +684,6 @@ func simpleGetDecode[T any](c *Client, ctx context.Context, endpoint string, ver
 		return nil, err
 	}
 
-	c.log("GET Decode: Endpoint(%s), Data(%s)", endpoint, data)
-
 	var result T
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, err
@@ -720,8 +698,6 @@ func simplePutDecode[T any](c *Client, ctx context.Context, endpoint string) (*T
 		return nil, err
 	}
 
-	c.log("PUT Decode: Endpoint(%s), Data(%s)", endpoint, data)
-
 	var result T
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, err
@@ -735,8 +711,6 @@ func simplePostDecode[T any](c *Client, ctx context.Context, endpoint string) (*
 	if err != nil {
 		return nil, err
 	}
-
-	c.log("POST Decode: Endpoint(%s), Data(%s)", endpoint, data)
 
 	var result T
 	if err := json.Unmarshal(data, &result); err != nil {
@@ -820,11 +794,6 @@ func (c *Client) GetGlobalEmotes(ctx context.Context) (*APIEmotesResponse, error
 
 func (c *Client) GetVideos(ctx context.Context, options GetVideosOptions) (*APIVideoResponse, error) {
 	query := "?" + parseOptions(&options)
-	if strings.Contains(query, "/videos?user_id=0x") {
-		c.log("FAIL")
-	} else {
-		c.log("SUCCESS")
-	}
 	endpoint := "/videos" + query
 	return simpleGetDecode[APIVideoResponse](c, ctx, endpoint, "helix")
 }
