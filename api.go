@@ -491,6 +491,37 @@ func parseOptions[T any](options *T) string {
 		field := v.Field(i)
 		fieldType := t.Field(i)
 
+		// Handle embedded structs
+		if fieldType.Anonymous && field.Kind() == reflect.Struct {
+			// Recursively parse embedded struct fields
+			for j := 0; j < field.NumField(); j++ {
+				embeddedField := field.Field(j)
+				embeddedFieldType := field.Type().Field(j)
+
+				if embeddedField.Kind() == reflect.Pointer {
+					embeddedField = embeddedField.Elem()
+				}
+
+				if !embeddedField.IsValid() || isZeroValue(embeddedField) {
+					continue
+				}
+
+				key := getJSONFieldName(embeddedFieldType)
+				if key == "" || key == "-" {
+					continue
+				}
+
+				if embeddedField.Kind() == reflect.Slice {
+					for k := 0; k < embeddedField.Len(); k++ {
+						parts = append(parts, fmt.Sprintf("%s=%v", key, embeddedField.Index(k)))
+					}
+				} else {
+					parts = append(parts, fmt.Sprintf("%s=%v", key, embeddedField))
+				}
+			}
+			continue
+		}
+
 		if field.Kind() == reflect.Pointer {
 			field = field.Elem()
 		}
